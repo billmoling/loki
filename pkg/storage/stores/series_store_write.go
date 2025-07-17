@@ -6,6 +6,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/otel"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/grafana/loki/v3/pkg/storage/config"
 	"github.com/grafana/loki/v3/pkg/storage/stores/index"
 	"github.com/grafana/loki/v3/pkg/util/constants"
-	util_log "github.com/grafana/loki/v3/pkg/util/log"
 	"github.com/grafana/loki/v3/pkg/util/spanlogger"
 )
 
@@ -73,7 +73,7 @@ func (c *Writer) PutOne(ctx context.Context, from, through model.Time, chk chunk
 	ctx, sp := tracer.Start(ctx, "SeriesStore.PutOne")
 	defer sp.End()
 
-	log := spanlogger.FromContext(ctx, util_log.Logger)
+	log := spanlogger.FromContext(ctx, log.Base())
 	defer log.Finish()
 
 	var (
@@ -89,18 +89,42 @@ func (c *Writer) PutOne(ctx context.Context, from, through model.Time, chk chunk
 	// If this chunk is in cache it must already be in the database so we don't need to write it again
 	found, _, _, _ := c.fetcher.Cache().Fetch(ctx, []string{c.schemaCfg.ExternalKey(chk.ChunkRef)})
 
-	if len(found) > 0 && !overlap {
-		writeChunk = false
-		DedupedChunksTotal.Inc()
-		encoded, err := chk.Encoded()
-		if err != nil {
-			level.Error(log).Log("msg", "failed to encode chunk, cannot record compressed de-duped chunk size", "err", err)
+	if len(found) > 0 {
+		if !overlap {
+			writeChunk = false
 		} else {
-			DedupedBytesTotal.Add(float64(len(encoded)))
+			// Overlap detected, but the chunk might be different. Further checks needed (see below).
+			// The original logic allowed writing chunks with overlap if it was found in the cache, but this is not desired.
+			cachedChunks, _, _, _ := c.fetcher.Cache().Fetch(ctx, []string{c.schemaCfg.ExternalKey(chk.ChunkRef)})
+			if len(cachedChunks) > 0 {
+				cachedChunk := cachedChunks[0]
+				encodedCurrent, err := chk.Encoded()
+				if err != nil {
+					level.Error(log).Log("msg", "failed to encode current chunk for comparison", "err", err)
+					// In case of encoding error, we can't reliably compare, so we assume they are different.
+					writeChunk = true
+				} else {
+					encodedCached, err := cachedChunk.Encoded()
+					if err != nil {
+						level.Error(log).Log("msg", "failed to encode cached chunk for comparison", "err", err)
+						writeChunk = true
+					} else {
+						if compareChunkContent(encodedCurrent, encodedCached) {
+							// Chunks are identical, skip the write
+							writeChunk = false
+							DedupedChunksTotal.Inc()
+							DedupedBytesTotal.Add(float64(len(encodedCurrent)))
+						} else {
+							// Chunks are different, proceed with the write
+							writeChunk = true
+						}
+					}
+				}
+			}
 		}
-
+	} else {
+		writeChunk = true
 	}
-
 	// If we dont have to write the chunk and DisableIndexDeduplication is false, we do not have to do anything.
 	// If we dont have to write the chunk and DisableIndexDeduplication is true, we have to write index and not chunk.
 	// Otherwise write both index and chunk.
